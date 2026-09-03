@@ -1,0 +1,619 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WiFiUdp.h>
+
+// ============================================================
+// Wi-Fi Configuration
+// ============================================================
+
+const char* AP_SSID = "ADPCM_VOICE";
+const char* AP_PASSWORD = "12345678";
+
+// Receiver ESP32 static IP
+IPAddress receiverIP(192, 168, 4, 2);
+
+const uint16_t UDP_PORT = 5005;
+
+// ============================================================
+// Web Server
+// ============================================================
+
+AsyncWebServer server(80);
+WiFiUDP udp;
+
+// ============================================================
+// Audio Configuration
+// ============================================================
+
+#define SAMPLE_RATE 8000
+#define PCM_BITS 16
+
+// ============================================================
+// IMA ADPCM Tables
+// ============================================================
+
+const int indexTable[16] = {
+  -1, -1, -1, -1, 2, 4, 6, 8,
+  -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+const int stepTable[89] = {
+   7, 8, 9, 10, 11, 12, 13, 14, 16,
+   17, 19, 21, 23, 25, 28, 31, 34, 37,
+   41, 45, 50, 55, 60, 66, 73, 80, 88,
+   97, 107, 118, 130, 143, 157, 173, 190,
+   209, 230, 253, 279, 307, 337, 371, 408,
+   449, 494, 544, 598, 658, 724, 796, 876,
+   963, 1060, 1166, 1282, 1411, 1552, 1707,
+   1878, 2066, 2272, 2499, 2749, 3024, 3327,
+   3660, 4026, 4428, 4871, 5358, 5894, 6484,
+   7132, 7845, 8630, 9493, 10442, 11487, 12635,
+   13899, 15289, 16818, 18500, 20350, 22385,
+   24623, 27086, 29794, 32767
+};
+
+// ============================================================
+// ADPCM State
+// ============================================================
+
+int predictor = 0;
+int stepIndex = 0;
+
+// ============================================================
+// Statistics
+// ============================================================
+
+uint32_t packetsSent = 0;
+uint32_t bytesSent = 0;
+uint32_t pcmBytesReceived = 0;
+uint32_t adpcmBytesSent = 0;
+
+unsigned long transmissionStart = 0;
+
+// ============================================================
+// Packet Structure
+// ============================================================
+
+struct ADPCMPacket {
+
+  uint16_t sequence;
+
+  int16_t predictor;
+
+  uint8_t stepIndex;
+
+  uint16_t sampleCount;
+
+  uint8_t data[256];
+};
+
+uint16_t sequenceNumber = 0;
+
+// ============================================================
+// IMA ADPCM Encoder
+// ============================================================
+
+uint8_t encodeADPCM(int16_t sample)
+{
+  int step = stepTable[stepIndex];
+
+  int difference = sample - predictor;
+
+  uint8_t code = 0;
+
+  if (difference < 0)
+  {
+    code = 8;
+    difference = -difference;
+  }
+
+  if (difference >= step)
+  {
+    code |= 4;
+    difference -= step;
+  }
+
+  if (difference >= step / 2)
+  {
+    code |= 2;
+    difference -= step / 2;
+  }
+
+  if (difference >= step / 4)
+  {
+    code |= 1;
+  }
+
+  int diffq = step >> 3;
+
+  if (code & 4)
+    diffq += step;
+
+  if (code & 2)
+    diffq += step >> 1;
+
+  if (code & 1)
+    diffq += step >> 2;
+
+  if (code & 8)
+    predictor -= diffq;
+  else
+    predictor += diffq;
+
+  if (predictor > 32767)
+    predictor = 32767;
+
+  if (predictor < -32768)
+    predictor = -32768;
+
+  stepIndex += indexTable[code];
+
+  if (stepIndex < 0)
+    stepIndex = 0;
+
+  if (stepIndex > 88)
+    stepIndex = 88;
+
+  return code & 0x0F;
+}
+
+// ============================================================
+// Send ADPCM Packet
+// ============================================================
+
+void sendADPCM(uint8_t* pcmData, size_t length)
+{
+  uint16_t sampleCount = length / 2;
+
+  ADPCMPacket packet;
+
+  packet.sequence = sequenceNumber++;
+
+  // Store state before encoding
+  packet.predictor = predictor;
+  packet.stepIndex = stepIndex;
+
+  packet.sampleCount = sampleCount;
+
+  memset(packet.data, 0, sizeof(packet.data));
+
+  uint8_t currentByte = 0;
+  bool lowNibble = true;
+
+  for (uint16_t i = 0; i < sampleCount; i++)
+  {
+    int16_t sample;
+
+    memcpy(&sample, &pcmData[i * 2], 2);
+
+    uint8_t code = encodeADPCM(sample);
+
+    if (lowNibble)
+    {
+      currentByte = code;
+      lowNibble = false;
+    }
+    else
+    {
+      currentByte |= (code << 4);
+
+      packet.data[i / 2] = currentByte;
+
+      currentByte = 0;
+      lowNibble = true;
+    }
+  }
+
+  // Handle odd number of samples
+  if (!lowNibble)
+  {
+    packet.data[sampleCount / 2] = currentByte;
+  }
+
+  uint16_t adpcmSize = (sampleCount + 1) / 2;
+
+  size_t headerSize =
+    sizeof(packet.sequence) +
+    sizeof(packet.predictor) +
+    sizeof(packet.stepIndex) +
+    sizeof(packet.sampleCount);
+
+  size_t totalSize = headerSize + adpcmSize;
+
+  // Send packet
+  udp.beginPacket(receiverIP, UDP_PORT);
+
+  udp.write((uint8_t*)&packet.sequence,
+            sizeof(packet.sequence));
+
+  udp.write((uint8_t*)&packet.predictor,
+            sizeof(packet.predictor));
+
+  udp.write((uint8_t*)&packet.stepIndex,
+            sizeof(packet.stepIndex));
+
+  udp.write((uint8_t*)&packet.sampleCount,
+            sizeof(packet.sampleCount));
+
+  udp.write(packet.data, adpcmSize);
+
+  udp.endPacket();
+
+  packetsSent++;
+
+  pcmBytesReceived += length;
+  adpcmBytesSent += adpcmSize;
+
+  bytesSent += totalSize;
+}
+
+// ============================================================
+// Receive PCM Audio from Browser
+// ============================================================
+
+void handleAudioData(
+  AsyncWebServerRequest *request,
+  uint8_t *data,
+  size_t len,
+  size_t index,
+  size_t total)
+{
+  if (index == 0)
+  {
+    transmissionStart = millis();
+  }
+
+  // Process incoming PCM audio
+  sendADPCM(data, len);
+
+  if (index + len == total)
+  {
+    Serial.println("Audio chunk processed");
+  }
+}
+
+// ============================================================
+// Dashboard HTML
+// ============================================================
+
+const char dashboard[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>ADPCM Voice Communication</title>
+
+<style>
+
+body {
+    font-family: Arial;
+    background:#111;
+    color:white;
+    text-align:center;
+}
+
+.card {
+    background:#222;
+    margin:15px auto;
+    padding:20px;
+    max-width:500px;
+    border-radius:12px;
+}
+
+button {
+    padding:15px 25px;
+    margin:10px;
+    font-size:16px;
+}
+
+.value {
+    font-size:22px;
+    color:#00ff88;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Digital Voice Communication</h1>
+
+<div class="card">
+
+<h2>Voice Transmission</h2>
+
+<button onclick="startRecording()">
+START RECORDING
+</button>
+
+<button onclick="stopRecording()">
+STOP
+</button>
+
+<p>Sampling Rate</p>
+<div class="value">8 kHz</div>
+
+<p>Mode</p>
+<div class="value">ADPCM</div>
+
+<p>PCM Data</p>
+<div id="pcm" class="value">0 KB</div>
+
+<p>ADPCM Data</p>
+<div id="adpcm" class="value">0 KB</div>
+
+<p>Compression Ratio</p>
+<div id="compression" class="value">0 : 1</div>
+
+<p>Wi-Fi Status</p>
+<div class="value">CONNECTED</div>
+
+</div>
+
+<script>
+
+let audioContext;
+let processor;
+let stream;
+
+let pcmTotal = 0;
+
+async function startRecording()
+{
+
+    stream =
+      await navigator.mediaDevices.getUserMedia({
+          audio:true
+      });
+
+    audioContext =
+      new AudioContext({
+          sampleRate:8000
+      });
+
+    const source =
+      audioContext.createMediaStreamSource(stream);
+
+    processor =
+      audioContext.createScriptProcessor(
+          4096,
+          1,
+          1
+      );
+
+    processor.onaudioprocess =
+      function(event)
+    {
+
+        const input =
+          event.inputBuffer
+          .getChannelData(0);
+
+        // Convert Float32 → 16-bit PCM
+
+        const pcm =
+          new Int16Array(input.length);
+
+        for(let i=0;i<input.length;i++)
+        {
+            let value =
+              Math.max(-1,
+              Math.min(1,input[i]));
+
+            pcm[i] =
+              value < 0
+              ? value * 32768
+              : value * 32767;
+        }
+
+        pcmTotal += pcm.byteLength;
+
+        fetch("/audio",
+        {
+            method:"POST",
+            headers:{
+                "Content-Type":
+                "application/octet-stream"
+            },
+            body:pcm.buffer
+        });
+
+        updateDashboard();
+    };
+
+    source.connect(processor);
+
+    processor.connect(
+        audioContext.destination
+    );
+
+}
+
+function stopRecording()
+{
+
+    if(processor)
+        processor.disconnect();
+
+    if(stream)
+    {
+        stream.getTracks().forEach(
+            track => track.stop()
+        );
+    }
+
+}
+
+async function updateDashboard()
+{
+
+    const response =
+      await fetch("/stats");
+
+    const data =
+      await response.json();
+
+    document.getElementById("pcm")
+      .innerHTML =
+      (data.pcm / 1024).toFixed(2)
+      + " KB";
+
+    document.getElementById("adpcm")
+      .innerHTML =
+      (data.adpcm / 1024).toFixed(2)
+      + " KB";
+
+    if(data.adpcm > 0)
+    {
+        document.getElementById("compression")
+        .innerHTML =
+        (data.pcm / data.adpcm)
+        .toFixed(2)
+        + " : 1";
+    }
+
+}
+
+</script>
+
+</body>
+
+</html>
+
+)rawliteral";
+
+// ============================================================
+// Statistics API
+// ============================================================
+
+void sendStats(AsyncWebServerRequest *request)
+{
+
+  String json = "{";
+
+  json += "\"pcm\":";
+  json += pcmBytesReceived;
+
+  json += ",\"adpcm\":";
+  json += adpcmBytesSent;
+
+  json += ",\"packets\":";
+  json += packetsSent;
+
+  json += ",\"wifi\":\"CONNECTED\"";
+
+  json += "}";
+
+  request->send(
+      200,
+      "application/json",
+      json
+  );
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+void setup()
+{
+
+  Serial.begin(115200);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ADPCM VOICE TRANSMITTER");
+  Serial.println("ESP32 #1");
+  Serial.println("================================");
+
+  // ----------------------------------------------------------
+  // Create Wi-Fi Access Point
+  // ----------------------------------------------------------
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+      AP_SSID,
+      AP_PASSWORD
+  );
+
+  Serial.print("Wi-Fi SSID: ");
+  Serial.println(AP_SSID);
+
+  Serial.print("Dashboard IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // ----------------------------------------------------------
+  // Start UDP
+  // ----------------------------------------------------------
+
+  udp.begin(UDP_PORT);
+
+  // ----------------------------------------------------------
+  // Web Dashboard
+  // ----------------------------------------------------------
+
+  server.on(
+      "/",
+      HTTP_GET,
+      [](AsyncWebServerRequest *request)
+      {
+        request->send_P(
+            200,
+            "text/html",
+            dashboard
+        );
+      }
+  );
+
+  // ----------------------------------------------------------
+  // Audio Data Endpoint
+  // ----------------------------------------------------------
+
+  server.on(
+      "/audio",
+      HTTP_POST,
+      [](AsyncWebServerRequest *request)
+      {
+        request->send(
+            200,
+            "text/plain",
+            "OK"
+        );
+      },
+      NULL,
+      handleAudioData
+  );
+
+  // ----------------------------------------------------------
+  // Statistics
+  // ----------------------------------------------------------
+
+  server.on(
+      "/stats",
+      HTTP_GET,
+      sendStats
+  );
+
+  server.begin();
+
+  Serial.println("Web server started");
+  Serial.println("Ready for voice transmission");
+}
+
+// ============================================================
+// Loop
+// ============================================================
+
+void loop()
+{
+  // Everything is handled asynchronously
+}
